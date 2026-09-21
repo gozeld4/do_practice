@@ -1,14 +1,15 @@
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, Header, Request, status
+from fastapi import Depends, FastAPI, Header, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from sqlalchemy import select, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.clock import Clock, get_clock
 from app.config import get_settings
 from app.domain.schemas import JobOut
 from app.domain.states import IllegalTransition, transition, transition_task
@@ -21,15 +22,25 @@ from app.errors import (
     illegal_transition_handler,
     unhandled_exception_handler,
 )
+from app.idempotency import request_hash
+from app.ratelimit import TokenBucket
 from app.store.db import get_session
 from app.store.models import Job, Task
 
 app = FastAPI()
+rate_limiter = TokenBucket()
+
+
+def get_rate_limiter() -> TokenBucket:
+    return rate_limiter
 
 
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
     request.state.request_id = str(uuid4())
+    content_length = request.headers.get("content-length")
+    if content_length is not None and int(content_length) > get_settings().max_body_bytes:
+        return error_response(request, 413, "payload_too_large", "request body is too large")
     response = await call_next(request)
     response.headers["X-Request-ID"] = request.state.request_id
     return response
@@ -78,9 +89,16 @@ def version() -> dict[str, str]:
 @app.post("/v1/jobs", response_model=JobOut, status_code=status.HTTP_201_CREATED)
 def create_job(
     job_create: JobCreate,
+    limiter: Annotated[TokenBucket, Depends(get_rate_limiter)],
     session: Annotated[Session, Depends(get_session)],
+    clock: Annotated[Clock, Depends(get_clock)],
+    response: Response,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> Job:
+    allowed, retry_after = limiter.try_acquire((job_create.tenant_id, job_create.user_id))
+    if not allowed:
+        raise AppError(429, "rate_limited", "submission rate limit exceeded", retry_after=retry_after)
+
     if not idempotency_key:
         raise AppError(400, "missing_idempotency_key", "Idempotency-Key header is required")
 
@@ -89,19 +107,67 @@ def create_job(
         error = errors[0]
         raise AppError(422, error.code, error.message, error.field)
 
+    body_hash = request_hash(job_create)
+    existing = session.scalar(
+        select(Job)
+        .options(selectinload(Job.tasks))
+        .where(Job.tenant_id == job_create.tenant_id, Job.idempotency_key == idempotency_key)
+    )
+    if existing is not None:
+        if existing.request_hash != body_hash:
+            raise AppError(422, "idempotency_key_conflict", "Idempotency-Key was used with a different request")
+        response.status_code = status.HTTP_200_OK
+        return existing
+
+    session.rollback()
+    pending_count = session.scalar(
+        select(func.count()).select_from(Job).where(
+            Job.tenant_id == job_create.tenant_id,
+            Job.state == "PENDING",
+        )
+    )
+    if pending_count >= get_settings().max_pending_per_tenant:
+        raise AppError(
+            429,
+            "too_many_pending",
+            f"tenant {job_create.tenant_id} has reached its pending job limit",
+            "tenant_id",
+        )
+    session.rollback()
+
     job_data = job_create.model_dump()
     resources = job_data.pop("resources")
     task_count = job_data["replicas"] if job_data["type"] == "training" else job_data["shards"]
+    job_data["replicas"] = job_data["replicas"] or 1
+    job_data["shards"] = job_data["shards"] or 1
     job = Job(
         **job_data,
         accelerator_type=resources["accelerator_type"],
         accelerators_per_task=resources["accelerators_per_task"],
+        idempotency_key=idempotency_key,
+        request_hash=body_hash,
+        created_at=clock.now(),
+        updated_at=clock.now(),
     )
-    with session.begin():
-        session.add(job)
-        session.flush()
-        job.tasks = [Task(job_id=job.id, index=index) for index in range(task_count)]
-        session.flush()
+    try:
+        with session.begin():
+            session.add(job)
+            session.flush()
+            job.tasks = [Task(job_id=job.id, index=index) for index in range(task_count)]
+            session.flush()
+    except IntegrityError:
+        session.rollback()
+        existing = session.scalar(
+            select(Job)
+            .options(selectinload(Job.tasks))
+            .where(Job.tenant_id == job_create.tenant_id, Job.idempotency_key == idempotency_key)
+        )
+        if existing is None:
+            raise
+        if existing.request_hash != body_hash:
+            raise AppError(422, "idempotency_key_conflict", "Idempotency-Key was used with a different request")
+        response.status_code = status.HTTP_200_OK
+        return existing
     return job
 
 

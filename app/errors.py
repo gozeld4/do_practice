@@ -10,12 +10,20 @@ logger = logging.getLogger(__name__)
 
 
 class AppError(Exception):
-    def __init__(self, status: int, code: str, message: str, field: str | None = None) -> None:
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        field: str | None = None,
+        retry_after: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
         self.field = field
+        self.retry_after = retry_after
 
 
 def error_response(
@@ -24,8 +32,12 @@ def error_response(
     code: str,
     message: str,
     field: str | None = None,
+    retry_after: float | None = None,
 ) -> JSONResponse:
     request_id = request.state.request_id
+    headers = {"X-Request-ID": request_id}
+    if retry_after is not None:
+        headers["Retry-After"] = str(int(retry_after))
     return JSONResponse(
         status_code=status,
         content={
@@ -36,12 +48,12 @@ def error_response(
                 "request_id": request_id,
             }
         },
-        headers={"X-Request-ID": request_id},
+        headers=headers,
     )
 
 
 async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
-    return error_response(request, exc.status, exc.code, exc.message, exc.field)
+    return error_response(request, exc.status, exc.code, exc.message, exc.field, exc.retry_after)
 
 
 async def illegal_transition_handler(request: Request, exc: IllegalTransition) -> JSONResponse:

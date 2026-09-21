@@ -11,6 +11,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from app.clock import current_time
+
 
 class Base(DeclarativeBase):
     pass
@@ -25,11 +27,14 @@ class Job(Base):
         CheckConstraint("replicas > 0", name="ck_jobs_replicas_positive"),
         CheckConstraint("shards > 0", name="ck_jobs_shards_positive"),
         CheckConstraint("state IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED')", name="ck_jobs_state"),
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_jobs_tenant_id_idempotency_key"),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     tenant_id: Mapped[str] = mapped_column(String(255), nullable=False)
     user_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     type: Mapped[str] = mapped_column(String(32), nullable=False)
     accelerator_type: Mapped[str] = mapped_column(String(64), nullable=False)
     accelerators_per_task: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -41,9 +46,9 @@ class Job(Base):
     shards: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     state: Mapped[str] = mapped_column(String(16), nullable=False, default="PENDING")
     pending_reason: Mapped[str | None] = mapped_column(String(32))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=current_time)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=current_time, onupdate=current_time
     )
     tasks: Mapped[list["Task"]] = relationship(back_populates="job", cascade="all, delete-orphan")
 
@@ -65,8 +70,8 @@ class Task(Base):
     node_id: Mapped[str | None] = mapped_column(String(255))
     checkpoint_ref: Mapped[str | None] = mapped_column(String(2048))
     output_ref: Mapped[str | None] = mapped_column(String(2048))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=current_time)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=current_time, onupdate=current_time
     )
     job: Mapped[Job] = relationship(back_populates="tasks")

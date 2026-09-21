@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     app_version: str = "dev"
     tenant_quotas: dict[str, int] = {"acme": 16, "globex": 8}
     accelerator_types: list[str] = ["a100", "h100"]
+    max_pending_per_tenant: int = 1000
+    max_body_bytes: int = 64 * 1024
 
     @field_validator("database_url")
     @classmethod
