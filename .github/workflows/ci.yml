@@ -38,6 +38,9 @@ jobs:
       - name: Lint
         run: uv run ruff check .
 
+      - name: Run migrations
+        run: uv run alembic upgrade head
+
       - name: Test
         run: uv run python -m pytest -q
         env:
