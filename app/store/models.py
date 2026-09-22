@@ -69,6 +69,7 @@ class Task(Base):
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     node_id: Mapped[str | None] = mapped_column(String(255))
     checkpoint_ref: Mapped[str | None] = mapped_column(String(2048))
+    error: Mapped[str | None] = mapped_column(String(2048))
     output_ref: Mapped[str | None] = mapped_column(String(2048))
     lease_id: Mapped[str | None] = mapped_column(String(255))
     epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

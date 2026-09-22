@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from typing import Annotated
 from uuid import UUID, uuid4
 
@@ -15,7 +16,15 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.clock import Clock, get_clock
 from app.config import get_settings
 from app.domain.loop import run_one_tick
-from app.domain.schemas import AssignmentOut, JobOut, NodeOut, NodeUpsert
+from app.domain.rollup import rollup
+from app.domain.schemas import (
+    AssignmentOut,
+    CompleteIn,
+    HeartbeatIn,
+    JobOut,
+    NodeOut,
+    NodeUpsert,
+)
 from app.domain.states import IllegalTransition, transition, transition_task
 from app.domain.validation import JobCreate, validate
 from app.errors import (
@@ -29,6 +38,7 @@ from app.errors import (
 from app.idempotency import request_hash
 from app.ratelimit import TokenBucket
 from app.store.db import engine, get_session
+from app.store.lease import update_if_current
 from app.store.models import Job, Node, Task
 
 logger = logging.getLogger(__name__)
@@ -239,6 +249,7 @@ def cancel_job(job_id: UUID, session: Annotated[Session, Depends(get_session)]) 
         for task in job.tasks:
             if task.state in {"PENDING", "LEASED"}:
                 task.state = transition_task(task.state, "FAILED")
+                rollup(session, job.id)
         session.flush()
     return job
 
@@ -297,3 +308,66 @@ def node_assignments(
         }
         for task in tasks
     ]
+
+
+def _assignment(task: Task) -> dict[str, object]:
+    return {
+        "task_id": task.id,
+        "job_id": task.job_id,
+        "lease_id": task.lease_id,
+        "epoch": task.epoch,
+        "expires_at": task.expires_at,
+        "checkpoint_ref": task.checkpoint_ref,
+    }
+
+
+@app.post("/v1/leases/{lease_id}/heartbeat", response_model=AssignmentOut)
+def lease_heartbeat(
+    lease_id: str,
+    heartbeat: HeartbeatIn,
+    session: Annotated[Session, Depends(get_session)],
+    clock: Annotated[Clock, Depends(get_clock)],
+) -> dict[str, object]:
+    changes: dict[str, object] = {
+        "expires_at": clock.now() + timedelta(seconds=get_settings().lease_ttl_seconds),
+    }
+    if "checkpoint_ref" in heartbeat.model_fields_set:
+        changes["checkpoint_ref"] = heartbeat.checkpoint_ref
+
+    with session.begin():
+        if not update_if_current(session, lease_id, heartbeat.epoch, clock.now(), **changes):
+            raise AppError(409, "lease_not_current", "lease is expired, stale, or no longer leased")
+        task = session.scalar(select(Task).where(Task.lease_id == lease_id, Task.epoch == heartbeat.epoch))
+        if task is None:
+            raise AppError(409, "lease_not_current", "lease is expired, stale, or no longer leased")
+        session.flush()
+    return _assignment(task)
+
+
+@app.post("/v1/leases/{lease_id}/complete", response_model=AssignmentOut)
+def lease_complete(
+    lease_id: str,
+    completion: CompleteIn,
+    session: Annotated[Session, Depends(get_session)],
+    clock: Annotated[Clock, Depends(get_clock)],
+) -> dict[str, object]:
+    if completion.status == "succeeded":
+        changes = {
+            "state": "COMMITTED",
+            "output_ref": completion.output_ref,
+            "lease_id": None,
+            "expires_at": None,
+        }
+    else:
+        changes = {"state": "FAILED", "error": completion.error}
+
+    with session.begin():
+        if not update_if_current(session, lease_id, completion.epoch, clock.now(), **changes):
+            raise AppError(409, "lease_not_current", "lease is expired, stale, or no longer leased")
+        task = session.scalar(select(Task).where(Task.lease_id == lease_id, Task.epoch == completion.epoch))
+        if task is None:
+            raise AppError(409, "lease_not_current", "lease is expired, stale, or no longer leased")
+
+        rollup(session, task.job_id)
+        session.flush()
+    return _assignment(task)

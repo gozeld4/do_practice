@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.clock import Clock
 from app.config import Settings
+from app.domain.rollup import rollup
 from app.domain.scheduling import ScheduleResult
 from app.domain.states import transition, transition_task
 from app.store.models import Job, Task
@@ -26,6 +27,7 @@ def apply(session: Session, result: ScheduleResult, clock: Clock, settings: Sett
             task.lease_id = str(uuid4())
             task.epoch += 1
             task.expires_at = expires_at
+            rollup(session, task.job_id)
 
             job = task.job
             if job.state != "RUNNING":
