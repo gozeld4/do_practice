@@ -1,3 +1,6 @@
+import asyncio
+import logging
+from contextlib import asynccontextmanager
 from typing import Annotated
 from uuid import UUID, uuid4
 
@@ -11,7 +14,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.clock import Clock, get_clock
 from app.config import get_settings
-from app.domain.schemas import JobOut
+from app.domain.loop import run_one_tick
+from app.domain.schemas import AssignmentOut, JobOut, NodeOut, NodeUpsert
 from app.domain.states import IllegalTransition, transition, transition_task
 from app.domain.validation import JobCreate, validate
 from app.errors import (
@@ -24,10 +28,39 @@ from app.errors import (
 )
 from app.idempotency import request_hash
 from app.ratelimit import TokenBucket
-from app.store.db import get_session
-from app.store.models import Job, Task
+from app.store.db import engine, get_session
+from app.store.models import Job, Node, Task
 
-app = FastAPI()
+logger = logging.getLogger(__name__)
+
+
+async def scheduler_loop(stop_event: asyncio.Event, clock: Clock) -> None:
+    settings = get_settings()
+    while not stop_event.is_set():
+        try:
+            with Session(engine) as session:
+                run_one_tick(session, clock)
+        except Exception:
+            logger.exception("scheduler tick failed")
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=settings.scheduler_tick_seconds)
+        except TimeoutError:
+            continue
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(scheduler_loop(stop_event, get_clock()))
+    try:
+        yield
+    finally:
+        stop_event.set()
+        await task
+
+
+app = FastAPI(lifespan=lifespan)
 rate_limiter = TokenBucket()
 
 
@@ -208,3 +241,59 @@ def cancel_job(job_id: UUID, session: Annotated[Session, Depends(get_session)]) 
                 task.state = transition_task(task.state, "FAILED")
         session.flush()
     return job
+
+
+@app.put("/v1/nodes/{node_id}", response_model=NodeOut)
+def upsert_node(
+    node_id: str,
+    node_upsert: NodeUpsert,
+    session: Annotated[Session, Depends(get_session)],
+    clock: Annotated[Clock, Depends(get_clock)],
+    response: Response,
+) -> Node:
+    if node_upsert.accelerator_type not in get_settings().accelerator_types:
+        raise AppError(
+            422,
+            "unknown_accelerator_type",
+            f"unknown accelerator type: {node_upsert.accelerator_type}",
+            "accelerator_type",
+        )
+
+    node = session.get(Node, node_id)
+    now = clock.now()
+    if node is None:
+        node = Node(id=node_id, **node_upsert.model_dump(), last_seen=now)
+        response.status_code = status.HTTP_201_CREATED
+    else:
+        node.pool = node_upsert.pool
+        node.accelerator_type = node_upsert.accelerator_type
+        node.capacity = node_upsert.capacity
+        node.last_seen = now
+
+    session.add(node)
+    session.commit()
+    return node
+
+
+@app.get("/v1/nodes/{node_id}/assignments", response_model=list[AssignmentOut])
+def node_assignments(
+    node_id: str,
+    session: Annotated[Session, Depends(get_session)],
+) -> list[AssignmentOut]:
+    if session.get(Node, node_id) is None:
+        raise AppError(404, "node_not_found", f"node {node_id} not found")
+
+    tasks = session.scalars(
+        select(Task).where(Task.node_id == node_id, Task.state == "LEASED").order_by(Task.index)
+    ).all()
+    return [
+        {
+            "task_id": task.id,
+            "job_id": task.job_id,
+            "lease_id": task.lease_id,
+            "epoch": task.epoch,
+            "expires_at": task.expires_at,
+            "checkpoint_ref": task.checkpoint_ref,
+        }
+        for task in tasks
+    ]

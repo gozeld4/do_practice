@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     accelerator_types: list[str] = ["a100", "h100"]
     max_pending_per_tenant: int = 1000
     max_body_bytes: int = 64 * 1024
+    lease_ttl_seconds: int = 30
+    scheduler_tick_seconds: float = 1.0
 
     @field_validator("database_url")
     @classmethod

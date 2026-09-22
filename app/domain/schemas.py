@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class TaskOut(BaseModel):
@@ -39,3 +39,25 @@ class JobOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     tasks: list[TaskOut]
+
+
+class NodeUpsert(BaseModel):
+    pool: str
+    accelerator_type: str
+    capacity: int = Field(ge=1)
+
+
+class NodeOut(NodeUpsert):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    last_seen: datetime
+
+
+class AssignmentOut(BaseModel):
+    task_id: UUID
+    job_id: UUID
+    lease_id: str | None
+    epoch: int
+    expires_at: datetime | None
+    checkpoint_ref: str | None

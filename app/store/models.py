@@ -70,8 +70,24 @@ class Task(Base):
     node_id: Mapped[str | None] = mapped_column(String(255))
     checkpoint_ref: Mapped[str | None] = mapped_column(String(2048))
     output_ref: Mapped[str | None] = mapped_column(String(2048))
+    lease_id: Mapped[str | None] = mapped_column(String(255))
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=current_time)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=current_time, onupdate=current_time
     )
     job: Mapped[Job] = relationship(back_populates="tasks")
+
+
+class Node(Base):
+    __tablename__ = "nodes"
+    __table_args__ = (
+        CheckConstraint("capacity >= 1", name="ck_nodes_capacity_positive"),
+    )
+
+    id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    pool: Mapped[str] = mapped_column(String(255), nullable=False)
+    accelerator_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    capacity: Mapped[int] = mapped_column(Integer, nullable=False)
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=current_time)
